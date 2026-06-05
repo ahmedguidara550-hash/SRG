@@ -232,6 +232,13 @@ def creer_facture(client_nom="Client", client_tel=""):
     return fid, numero
 
 
+def _recalculer_total_facture(c, facture_id):
+    """Recalcule et met à jour le total HT/TTC d'une facture à partir de ses lignes."""
+    c.execute("SELECT SUM(total_ligne) FROM facture_lignes WHERE facture_id=?", (facture_id,))
+    total = c.fetchone()[0] or 0
+    c.execute("UPDATE factures SET total_ht=?, total_ttc=? WHERE id=?", (total, total, facture_id))
+
+
 def ajouter_ligne_facture(facture_id, piece_id, quantite):
     """Ajoute une ligne à la facture et décrémente le stock."""
     conn = get_connection()
@@ -252,9 +259,7 @@ def ajouter_ligne_facture(facture_id, piece_id, quantite):
 
     # Vérifier si la pièce est déjà dans cette facture
     c.execute("SELECT id, quantite FROM facture_lignes WHERE facture_id=? AND piece_id=?", (facture_id, piece_id))
-    existing = c.fetchone()
-
-    if existing:
+    if existing := c.fetchone():
         new_qty = existing["quantite"] + quantite
         new_total = prix_u * new_qty
         c.execute("UPDATE facture_lignes SET quantite=?, total_ligne=? WHERE id=?",
@@ -268,11 +273,7 @@ def ajouter_ligne_facture(facture_id, piece_id, quantite):
     # Décrémenter stock
     c.execute("UPDATE pieces SET quantite = quantite - ? WHERE id=?", (quantite, piece_id))
 
-    # Recalculer total facture
-    c.execute("SELECT SUM(total_ligne) FROM facture_lignes WHERE facture_id=?", (facture_id,))
-    total = c.fetchone()[0] or 0
-    c.execute("UPDATE factures SET total_ht=?, total_ttc=? WHERE id=?", (total, total, facture_id))
-
+    _recalculer_total_facture(c, facture_id)
     conn.commit()
     conn.close()
     return True, "OK"
@@ -283,17 +284,11 @@ def supprimer_ligne_facture(ligne_id):
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT * FROM facture_lignes WHERE id=?", (ligne_id,))
-    ligne = c.fetchone()
-    if ligne:
-        # Restaurer stock
+    if ligne := c.fetchone():
         c.execute("UPDATE pieces SET quantite = quantite + ? WHERE id=?",
                   (ligne["quantite"], ligne["piece_id"]))
         c.execute("DELETE FROM facture_lignes WHERE id=?", (ligne_id,))
-        # Recalculer total
-        facture_id = ligne["facture_id"]
-        c.execute("SELECT SUM(total_ligne) FROM facture_lignes WHERE facture_id=?", (facture_id,))
-        total = c.fetchone()[0] or 0
-        c.execute("UPDATE factures SET total_ht=?, total_ttc=? WHERE id=?", (total, total, facture_id))
+        _recalculer_total_facture(c, ligne["facture_id"])
         conn.commit()
     conn.close()
 
@@ -320,10 +315,8 @@ def finaliser_facture(facture_id, remise=0.0):
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT total_ht FROM factures WHERE id=?", (facture_id,))
-    row = c.fetchone()
-    if row:
-        total_ht = row["total_ht"]
-        total_ttc = total_ht * (1 - remise / 100)
+    if row := c.fetchone():
+        total_ttc = row["total_ht"] * (1 - remise / 100)
         c.execute("UPDATE factures SET statut='finalisée', remise=?, total_ttc=? WHERE id=?",
                   (remise, total_ttc, facture_id))
         conn.commit()
@@ -375,12 +368,13 @@ def get_stats():
     total_pieces = c.fetchone()["total_pieces"]
     c.execute("SELECT COUNT(*) as alertes FROM pieces WHERE quantite <= qmin AND qmin > 0")
     alertes = c.fetchone()["alertes"]
+    today = datetime.now().strftime('%Y-%m-%d')
     c.execute("SELECT COUNT(*) as factures_today FROM factures WHERE date_facture LIKE ? AND statut='finalisée'",
-              (f"{datetime.now().strftime('%Y-%m-%d')}%",))
+              (f"{today}%",))
     factures_today = c.fetchone()["factures_today"]
     c.execute("""SELECT COALESCE(SUM(total_ttc),0) as ca_today FROM factures
                  WHERE date_facture LIKE ? AND statut='finalisée'""",
-              (f"{datetime.now().strftime('%Y-%m-%d')}%",))
+              (f"{today}%",))
     ca_today = c.fetchone()["ca_today"]
     conn.close()
     return {
@@ -389,3 +383,139 @@ def get_stats():
         "factures_aujourd_hui": factures_today,
         "ca_aujourd_hui": ca_today
     }
+
+
+# ─────────────────────────────── RAPPORTS ───────────────────────────────
+
+def get_rapport_journalier(date_str=None):
+    """Retourne le rapport complet d'une journée. date_str = 'YYYY-MM-DD'."""
+    if date_str is None:
+        date_str = datetime.now().strftime('%Y-%m-%d')
+    conn = get_connection()
+    c = conn.cursor()
+
+    # Factures finalisées du jour
+    c.execute("""
+        SELECT * FROM factures
+        WHERE date_facture LIKE ? AND statut='finalisée'
+        ORDER BY date_facture DESC
+    """, (f"{date_str}%",))
+    factures = [dict(r) for r in c.fetchall()]
+
+    # Totaux CA
+    c.execute("""
+        SELECT
+            COUNT(*)                    as nb_factures,
+            COALESCE(SUM(total_ht),0)   as total_ht,
+            COALESCE(SUM(total_ttc),0)  as total_ttc
+        FROM factures
+        WHERE date_facture LIKE ? AND statut='finalisée'
+    """, (f"{date_str}%",))
+    totaux = dict(c.fetchone())
+
+    # Pièces vendues avec profit par ligne
+    c.execute("""
+        SELECT
+            fl.piece_id,
+            fl.piece_nom,
+            fl.piece_ref,
+            SUM(fl.quantite)                            as qte_vendue,
+            fl.prix_unitaire                            as prix_vente,
+            COALESCE(p.prix_achat, 0)                   as prix_achat,
+            SUM(fl.total_ligne)                         as total_vente,
+            SUM(fl.quantite * COALESCE(p.prix_achat,0)) as total_achat,
+            SUM(fl.total_ligne) - SUM(fl.quantite * COALESCE(p.prix_achat,0)) as profit_ligne
+        FROM facture_lignes fl
+        JOIN factures f ON fl.facture_id = f.id
+        LEFT JOIN pieces p ON fl.piece_id = p.id
+        WHERE f.date_facture LIKE ? AND f.statut='finalisée'
+        GROUP BY fl.piece_id, fl.prix_unitaire
+        ORDER BY qte_vendue DESC
+    """, (f"{date_str}%",))
+    pieces_vendues = [dict(r) for r in c.fetchall()]
+
+    profit_total = sum(pv["profit_ligne"] for pv in pieces_vendues)
+    conn.close()
+    return {
+        "date": date_str,
+        "factures": factures,
+        "totaux": totaux,
+        "pieces_vendues": pieces_vendues,
+        "profit_total": profit_total,
+    }
+
+
+def get_jours_avec_ventes(limit=30):
+    """Retourne les derniers jours ayant des ventes."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""
+        SELECT
+            DATE(date_facture) as jour,
+            COUNT(*)           as nb_factures,
+            COALESCE(SUM(total_ttc), 0) as ca_jour
+        FROM factures
+        WHERE statut='finalisée'
+        GROUP BY jour
+        ORDER BY jour DESC
+        LIMIT ?
+    """, (limit,))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+
+
+def modifier_ligne_facture(ligne_id, quantite_nouvelle, prix_unitaire_nouveau):
+    """Modifie quantité et/ou prix d'une ligne. Ajuste le stock."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM facture_lignes WHERE id=?", (ligne_id,))
+    ligne = c.fetchone()
+    if not ligne:
+        conn.close()
+        return False, "Ligne introuvable"
+
+    ancienne_qte = ligne["quantite"]
+    piece_id     = ligne["piece_id"]
+    facture_id   = ligne["facture_id"]
+    delta        = quantite_nouvelle - ancienne_qte
+
+    if delta > 0:
+        c.execute("SELECT quantite FROM pieces WHERE id=?", (piece_id,))
+        row = c.fetchone()
+        stock = row["quantite"] if row else 0
+        if stock < delta:
+            conn.close()
+            return False, f"Stock insuffisant (disponible: {stock})"
+
+    nouveau_total = quantite_nouvelle * prix_unitaire_nouveau
+    c.execute("""
+        UPDATE facture_lignes SET quantite=?, prix_unitaire=?, total_ligne=? WHERE id=?
+    """, (quantite_nouvelle, prix_unitaire_nouveau, nouveau_total, ligne_id))
+
+    # Ajuster le stock
+    if delta != 0:
+        c.execute("UPDATE pieces SET quantite = quantite - ? WHERE id=?", (delta, piece_id))
+
+    _recalculer_total_facture(c, facture_id)
+    conn.commit()
+    conn.close()
+    return True, "OK"
+
+
+def modifier_total_facture(facture_id, nouveau_total):
+    """Modifie directement le total TTC d'une facture (remise manuelle)."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT total_ht FROM factures WHERE id=?", (facture_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False, "Facture introuvable"
+    ht = row["total_ht"]
+    remise = round((1 - nouveau_total / ht) * 100, 2) if ht > 0 else 0
+    c.execute("UPDATE factures SET total_ttc=?, remise=? WHERE id=?",
+              (nouveau_total, remise, facture_id))
+    conn.commit()
+    conn.close()
+    return True, "OK"
