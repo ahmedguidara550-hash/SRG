@@ -36,9 +36,7 @@ def get_pieces():
 @app.route("/api/pieces/<int:pid>", methods=["GET"])
 def get_piece(pid):
     p = db.get_piece_by_id(pid)
-    if not p:
-        return resp(error="Pièce introuvable", status=404)
-    return resp(p)
+    return resp(p) if p else resp(error="Pièce introuvable", status=404)
 
 
 @app.route("/api/pieces", methods=["POST"])
@@ -121,9 +119,7 @@ def get_facture(fid):
 def add_ligne(fid):
     d = request.json
     ok, msg = db.ajouter_ligne_facture(fid, d["piece_id"], d.get("quantite", 1))
-    if not ok:
-        return resp(error=msg, status=400)
-    return resp({"ok": True})
+    return resp({"ok": True}) if ok else resp(error=msg, status=400)
 
 
 @app.route("/api/factures/lignes/<int:lid>", methods=["DELETE"])
